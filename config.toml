@@ -1,0 +1,21 @@
+[application]
+name = "BridgeX"
+version = "1.0.0"
+
+[theme]
+mode = "dark"
+
+[vector]
+app_name = "CANoe"
+channel = 0
+
+[zlg]
+device_type = 41
+device_index = 0
+channel = 0
+nominal_baud = 500000
+data_baud = 2000000
+
+[log]
+level = "DEBUG"
+save_days = 30
