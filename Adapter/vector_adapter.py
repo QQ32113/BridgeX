@@ -1,18 +1,34 @@
 # adapter/vector_adapter.py
+# Part 1
 
 from __future__ import annotations
 
-from core.frame import CANFrame
-from core.frame import FrameFormat
-from core.frame import FrameType
+from threading import Lock
+from threading import Thread
+from threading import Event
+from queue import Queue
+from queue import Empty
 
 from adapter.base_adapter import BaseAdapter
 
-from sdk.vector_sdk import VectorSDK
-from sdk.vector_sdk import XLcanTxMsg
-from sdk.vector_sdk import XL_CAN_EXT_MSG_ID
-from sdk.vector_sdk import XL_CAN_TXMSG_FLAG_BRS
-from sdk.vector_sdk import XL_CAN_TXMSG_FLAG_EDL
+from core.frame import CANFrame
+from core.frame import FrameType
+from core.frame import FrameFormat
+from core.frame import Direction
+
+from sdk.vector_sdk import (
+    VectorSDK,
+    XLcanTxEvent,
+    XL_CAN_EXT_MSG_ID,
+    XL_CAN_TXMSG_FLAG_EDL,
+    XL_CAN_TXMSG_FLAG_BRS,
+    XL_CAN_TXMSG_FLAG_ESI,
+    XL_CAN_TXMSG_FLAG_RTR,
+    XL_CAN_RXMSG_FLAG_EDL,
+    XL_CAN_RXMSG_FLAG_BRS,
+    XL_CAN_RXMSG_FLAG_ESI,
+    XL_CAN_RXMSG_FLAG_RTR,
+)
 
 
 class VectorAdapter(BaseAdapter):
@@ -23,19 +39,31 @@ class VectorAdapter(BaseAdapter):
 
         self.sdk = VectorSDK()
 
+        self.txQueue = Queue()
+
+        self.rxQueue = Queue()
+
+        self.txThread = None
+
+        self.rxThread = None
+
+        self.stopEvent = Event()
+
+        self.lock = Lock()
+
+        self.connected = False
+
+        self.channelMask = 0
+
     def open(self):
 
-        if not self.sdk.open_driver():
+        self.sdk.openDriver()
 
-            return False
+        self.sdk.getDriverConfig()
 
-        if not self.sdk.get_driver_config():
+        self.sdk.openPort("CANoe")
 
-            return False
-
-        if not self.sdk.open_port("CANoe"):
-
-            return False
+        self.connected = True
 
         self._opened = True
 
@@ -43,79 +71,256 @@ class VectorAdapter(BaseAdapter):
 
     def close(self):
 
-        self.sdk.close_port()
+        self.stop()
 
-        self.sdk.close_driver()
+        self.sdk.close()
+
+        self.connected = False
 
         self._opened = False
 
     def start(self):
 
-        self._started = self.sdk.activate_channel()
+        if self._started:
 
-        return self._started
+            return
+
+        self.sdk.activateChannel()
+
+        self.stopEvent.clear()
+
+        self.txThread = Thread(
+
+            target=self.__tx_loop,
+
+            daemon=True,
+
+            name="VectorTX"
+
+        )
+
+        self.rxThread = Thread(
+
+            target=self.__rx_loop,
+
+            daemon=True,
+
+            name="VectorRX"
+
+        )
+
+        self.txThread.start()
+
+        self.rxThread.start()
+
+        self._started = True
 
     def stop(self):
 
-        self.sdk.deactivate_channel()
+        self.stopEvent.set()
+
+        self.sdk.deactivateChannel()
 
         self._started = False
 
-    def send(self, frame: CANFrame):
+    def send(
 
-        msg = XLcanTxMsg()
+        self,
 
-        msg.canId = frame.arbitration_id
+        frame: CANFrame,
 
-        if frame.is_extended:
+    ):
 
-            msg.canId |= XL_CAN_EXT_MSG_ID
-
-        msg.dlc = frame.dlc
-
-        if frame.is_fd:
-
-            msg.msgFlags |= XL_CAN_TXMSG_FLAG_EDL
-
-        if frame.bitrate_switch:
-
-            msg.msgFlags |= XL_CAN_TXMSG_FLAG_BRS
-
-        for i in range(frame.length):
-
-            msg.data[i] = frame.data[i]
-
-        return self.sdk.transmit(msg)
+        self.txQueue.put(frame)
 
     def receive(self):
 
-        event = self.sdk.receive()
+        try:
 
-        if event is None:
+            return self.rxQueue.get_nowait()
+
+        except Empty:
 
             return None
 
-        frame = CANFrame()
+    def __build_tx_event(
 
-        frame.timestamp = event.timeStamp
+        self,
 
-        frame.channel = event.channelIndex
+        frame: CANFrame,
 
-        frame.arbitration_id = event.tagData.canId & 0x1FFFFFFF
+    ) -> XLcanTxEvent:
 
-        frame.dlc = event.tagData.dlc
+        event = XLcanTxEvent()
 
-        frame.update_length()
+        event.tag = 0
 
-        frame.frame_type = FrameType.CANFD if event.tagData.msgFlags & XL_CAN_TXMSG_FLAG_EDL else FrameType.CAN
+        event.channelIndex = frame.channel
 
-        frame.frame_format = FrameFormat.EXTENDED if event.tagData.canId & XL_CAN_EXT_MSG_ID else FrameFormat.STANDARD
+        event.timeStamp = frame.timestamp
 
-        frame.bitrate_switch = bool(event.tagData.msgFlags & XL_CAN_TXMSG_FLAG_BRS)
+        event.tagData.canId = frame.arbitration_id
+
+        if frame.frame_format == FrameFormat.EXTENDED:
+
+            event.tagData.canId |= XL_CAN_EXT_MSG_ID
+
+        event.tagData.dlc = frame.dlc
+
+        if frame.frame_type == FrameType.CANFD:
+
+            event.tagData.msgFlags |= XL_CAN_TXMSG_FLAG_EDL
+
+        if frame.bitrate_switch:
+
+            event.tagData.msgFlags |= XL_CAN_TXMSG_FLAG_BRS
+
+        if frame.error_state_indicator:
+
+            event.tagData.msgFlags |= XL_CAN_TXMSG_FLAG_ESI
+
+        if frame.remote:
+
+            event.tagData.msgFlags |= XL_CAN_TXMSG_FLAG_RTR
 
         for i in range(frame.length):
 
-            frame.data[i] = event.tagData.data[i]
+            event.tagData.data[i] = frame.data[i]
 
-        return frame
-    
+        return event
+
+        # adapter/vector_adapter.py
+        # Part 2
+
+        def __parse_rx_event(
+
+                self,
+
+                event,
+
+        ) -> CANFrame:
+
+            frame = CANFrame()
+
+            frame.timestamp = event.timeStamp
+
+            frame.channel = event.channelIndex
+
+            frame.arbitration_id = (
+
+                    event.tagData.canId & 0x1FFFFFFF
+
+            )
+
+            frame.dlc = event.tagData.dlc
+
+            frame.update_length()
+
+            if event.tagData.canId & XL_CAN_EXT_MSG_ID:
+
+                frame.frame_format = FrameFormat.EXTENDED
+
+            else:
+
+                frame.frame_format = FrameFormat.STANDARD
+
+            if event.tagData.msgFlags & XL_CAN_RXMSG_FLAG_EDL:
+
+                frame.frame_type = FrameType.CANFD
+
+            else:
+
+                frame.frame_type = FrameType.CAN
+
+            frame.bitrate_switch = bool(
+
+                event.tagData.msgFlags &
+
+                XL_CAN_RXMSG_FLAG_BRS
+
+            )
+
+            frame.error_state_indicator = bool(
+
+                event.tagData.msgFlags &
+
+                XL_CAN_RXMSG_FLAG_ESI
+
+            )
+
+            frame.remote = bool(
+
+                event.tagData.msgFlags &
+
+                XL_CAN_RXMSG_FLAG_RTR
+
+            )
+
+            frame.direction = Direction.RX
+
+            for i in range(frame.length):
+                frame.data[i] = event.tagData.data[i]
+
+            return frame
+
+        def __tx_loop(self):
+
+            while not self.stopEvent.is_set():
+
+                try:
+
+                    frame = self.txQueue.get(
+
+                        timeout=0.05
+
+                    )
+
+                except Empty:
+
+                    continue
+
+                packet = self.__build_tx_event(
+
+                    frame
+
+                )
+
+                self.sdk.canTransmitFD(
+
+                    packet
+
+                )
+
+        def __rx_loop(self):
+
+            while not self.stopEvent.is_set():
+
+                event = self.sdk.canReceiveFD()
+
+                if event is None:
+                    continue
+
+                frame = self.__parse_rx_event(
+
+                    event
+
+                )
+
+                self.rxQueue.put(
+
+                    frame
+
+                )
+
+        @property
+        def queue_size(self):
+
+            return self.rxQueue.qsize()
+
+        def clear(self):
+
+            while not self.txQueue.empty():
+                self.txQueue.get_nowait()
+
+            while not self.rxQueue.empty():
+                self.rxQueue.get_nowait()
